@@ -1,30 +1,36 @@
-ARG GO_VERSION=1.19
-ARG ALPINE_VERSION=3.15
+# Note: You can use any Debian/Ubuntu based image you want. 
+FROM mcr.microsoft.com/vscode/devcontainers/base:0-bullseye
 
-FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION}
-ARG USERNAME=vscode
+# [Option] Install zsh
+ARG INSTALL_ZSH="true"
+# [Option] Upgrade OS packages to their latest versions
+ARG UPGRADE_PACKAGES="false"
+# [Option] Enable non-root Docker access in container
+ARG ENABLE_NONROOT_DOCKER="true"
+# [Option] Use the OSS Moby CLI instead of the licensed Docker CLI
+ARG USE_MOBY="true"
+
+# Enable new "BUILDKIT" mode for Docker CLI
+ENV DOCKER_BUILDKIT=1
+
+# Install needed packages and setup non-root user. Use a separate RUN statement to add your
+# own dependencies. A user of "automatic" attempts to reuse an user ID if one already exists.
+ARG USERNAME=automatic
 ARG USER_UID=1000
-ARG USER_GID=1000
+ARG USER_GID=$USER_UID
+COPY library-scripts/*.sh /tmp/library-scripts/
+RUN apt-get update \
+    && /bin/bash /tmp/library-scripts/common-debian.sh "${INSTALL_ZSH}" "${USERNAME}" "${USER_UID}" "${USER_GID}" "${UPGRADE_PACKAGES}" "true" "true" \
+    # Use Docker script from script library to set things up
+    && /bin/bash /tmp/library-scripts/docker-debian.sh "${ENABLE_NONROOT_DOCKER}" "/var/run/docker-host.sock" "/var/run/docker.sock" "${USERNAME}" \
+    # Clean up
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/* /tmp/library-scripts/
 
-# Setup user
-RUN adduser $USERNAME -s /bin/sh -D -u $USER_UID $USER_GID && \
-    mkdir -p /etc/sudoers.d && \
-    echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME && \
-    chmod 0440 /etc/sudoers.d/$USERNAME
+# Setting the ENTRYPOINT to docker-init.sh will configure non-root access 
+# to the Docker socket. The script will also execute CMD as needed.
+ENTRYPOINT [ "/usr/local/share/docker-init.sh" ]
+CMD [ "sleep", "infinity" ]
 
-# Install packages and Go language server
-RUN apk add -q --update --progress --no-cache git sudo openssh-client zsh
-RUN go install -v golang.org/x/tools/gopls@latest
-RUN go install -v github.com/stamblerre/gocode@latest
-RUN go install -v github.com/rogpeppe/godef@latest
-
-# Setup shell
-USER $USERNAME
-RUN sh -c "$(wget -O- https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh)" "" --unattended &> /dev/null
-ENV ENV="/home/$USERNAME/.ashrc" \
-    ZSH=/home/$USERNAME/.oh-my-zsh \
-    EDITOR=vi \
-    LANG=en_US.UTF-8
-RUN printf 'ZSH_THEME="robbyrussell"\nENABLE_CORRECTION="false"\nplugins=(git copyfile extract colorize dotenv encode64 golang)\nsource $ZSH/oh-my-zsh.sh' > "/home/$USERNAME/.zshrc"
-RUN echo "exec `which zsh`" > "/home/$USERNAME/.ashrc"
-USER root
+# [Optional] Uncomment this section to install additional OS packages.
+# RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
+#     && apt-get -y install --no-install-recommends <your-package-list-here>

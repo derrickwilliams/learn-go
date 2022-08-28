@@ -33,6 +33,5 @@ func main() {
 	infoLog.Printf("Starting server on %s", *addr)
 
 	err := srv.ListenAndServe()
-
 	errorLog.Fatal(err)
 }
