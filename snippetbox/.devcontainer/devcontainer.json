@@ -1,0 +1,25 @@
+{
+    "name": "MCU Bible",
+    "dockerFile": "Dockerfile",
+    // "appPort": 8000,
+    "extensions": [
+        "ms-vscode.go",
+        "davidanson.vscode-markdownlint",
+        "shardulm94.trailing-spaces",
+        "IBM.output-colorizer",
+        "esbenp.prettier-vscode"
+    ],
+    "settings": {
+        "go.useLanguageServer": true
+    },
+    "postCreateCommand": "go mod init snippetbox.derrickw.me > /dev/null",
+    "runArgs": [
+        "-u",
+        "vscode",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt",
+        "seccomp=unconfined",
+        // map SSH keys for Git
+        "-v", "${env:HOME}/.ssh:/home/vscode/.ssh:ro"
+    ]
+}

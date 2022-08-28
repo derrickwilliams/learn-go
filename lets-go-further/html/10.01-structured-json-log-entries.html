@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta http-equiv="x-ua-compatible" content="ie=edge">
+		<meta name="author" content="Alex Edwards">
+		<meta name="copyright" content="Copyright Alex Edwards 2022">
+		<title>Structured JSON Log Entries &mdash; Let's Go Further</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+		<link rel="stylesheet" type="text/css" href="assets/css/main.css">
+		<link rel="icon" type="image/x-icon" href="assets/img/favicon.ico">
+	</head>
+	<body>
+		<header>
+			<div class="wrapper">
+				<div>
+					
+						
+						<a href="00.00-front-matter.html">Let's Go Further</a> <span class="crumbs">&rsaquo; <a href="10.00-structured-logging-and-error-handling.html">Structured Logging and Error Handling</a> &rsaquo; Structured JSON Log Entries</span>
+						
+					
+				</div>
+				<div>
+					&lsaquo; <a href="10.00-structured-logging-and-error-handling.html">Previous</a>
+					&middot; <a href="00.01-contents.html">Contents</a> &middot;
+					<a href="10.02-panic-recovery.html">Next</a> &rsaquo;
+				</div>
+			</div>
+		</header>
+		<main class="wrapper text">
+			<div class="chapter">Chapter 10.1.</div>
+			<h2 id="structured-json-log-entries">Structured JSON Log Entries</h2>
+
+<p>At the moment, all of our log entries are simple free-form messages prefixed by the current date and time, written to the <em>standard out</em> stream. A good example of these are the log entries that we see when we start the API:</p>
+
+<figure class="code bash">
+<pre>$ go run ./cmd/api
+<samp>2021/04/09 19:43:31 database connection pool established
+2021/04/09 19:43:31 starting development server on :4000</samp></pre>
+</figure>
+
+<p>For many applications this simple style of logging will be <em>good enough</em>, and there&rsquo;s no need to introduce additional complexity to your project.</p>
+
+<p>But for applications which do a lot of logging, it can often be useful to enforce a consistent structure and format for your log entries. This can help make it easier to distinguish between different types of log entry (like <em>informational</em> and <em>error</em> entries), easier to search and filter log entries, and simpler to integrate your logs with third-party analysis and monitoring systems.</p>
+
+<p>So in this chapter we&rsquo;re going demonstrate how to adapt our application so that log entries are written in a structured JSON format, similar to this:</p>
+
+<figure class="code bash">
+<pre>{&#34;level&#34;:&#34;INFO&#34;,&#34;time&#34;:&#34;2020-12-16T10:53:35Z&#34;,&#34;message&#34;:&#34;starting server&#34;,&#34;properties&#34;:{&#34;addr&#34;:&#34;:4000&#34;,&#34;env&#34;:&#34;development&#34;}}</pre>
+</figure>
+
+<p>Essentially, each log entry will be a single JSON object containing the following key/value pairs:</p>
+
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+
+<tbody>
+<tr>
+<td><strong>level</strong></td>
+<td>A code indicating the severity of the log entry. In this project we will use the following three severity levels, ordered from least to most severe: <br/>- <code>INFO</code> (least severe)<br/>- <code>ERROR</code><br/>- <code>FATAL</code> (most severe)</td>
+</tr>
+
+<tr>
+<td><strong>time</strong></td>
+<td>The UTC time that the log entry was made with second precision.</td>
+</tr>
+
+<tr>
+<td><strong>message</strong></td>
+<td>A string containing the free-text information or error message.</td>
+</tr>
+
+<tr>
+<td><strong>properties</strong></td>
+<td>Any additional information relevant to the log entry in string key/value pairs (optional).</td>
+</tr>
+
+<tr>
+<td><strong>trace</strong></td>
+<td>A stack trace for debugging purposes (optional).</td>
+</tr>
+</tbody>
+</table>
+
+<h3 id="creating-a-custom-logger">Creating a custom logger</h3>
+
+<p>To implement this in our API, we&rsquo;re going to create our own custom <code>Logger</code> type which writes structured log entries in JSON format.</p>
+
+<p>We&rsquo;ll implement some convenience methods on <code>Logger</code>, such as <code>PrintInfo()</code> and <code>PrintError()</code>, in order to make it easy to write log entries with a specific level from our application in a single command. And we&rsquo;ll also design the logger so that only entries at or above a certain <em>minimum severity level</em> are actually logged &mdash; so if you only want to record <code>ERROR</code> and <code>FATAL</code> messages (and not <code>INFO</code> messages), then that is easy to do.</p>
+
+<p>If you&rsquo;re following along, go ahead and create a new <code>internal/jsonlog</code> package like so:</p>
+
+<figure class="code bash">
+<pre>$ mkdir internal/jsonlog
+$ touch internal/jsonlog/jsonlog.go</pre>
+</figure>
+
+<p>And then add the following code:</p>
+
+<figure class="code go">
+<figcaption>File: internal/jsonlog/jsonlog.go</figcaption>
+<pre><span class="kn">package</span> <span class="nx">jsonlog</span>
+
+<span class="kn">import</span> <span class="p">(</span>
+    <span class="s">&#34;encoding/json&#34;</span>
+    <span class="s">&#34;io&#34;</span>
+    <span class="s">&#34;os&#34;</span>
+    <span class="s">&#34;runtime/debug&#34;</span>
+    <span class="s">&#34;sync&#34;</span>
+    <span class="s">&#34;time&#34;</span>
+<span class="p">)</span>
+
+<span class="c1">// Define a Level type to represent the severity level for a log entry.
+</span><span class="c1"></span><span class="kd">type</span> <span class="nx">Level</span> <span class="kt">int8</span>
+
+<span class="c1">// Initialize constants which represent a specific severity level. We use the iota
+</span><span class="c1"></span><span class="c1">// keyword as a shortcut to assign successive integer values to the constants.
+</span><span class="c1"></span><span class="kd">const</span> <span class="p">(</span>
+    <span class="nx">LevelInfo</span>  <span class="nx">Level</span> <span class="p">=</span> <span class="kc">iota</span> <span class="c1">// Has the value 0.
+</span><span class="c1"></span>    <span class="nx">LevelError</span>              <span class="c1">// Has the value 1.
+</span><span class="c1"></span>    <span class="nx">LevelFatal</span>              <span class="c1">// Has the value 2.
+</span><span class="c1"></span>    <span class="nx">LevelOff</span>                <span class="c1">// Has the value 3.
+</span><span class="c1"></span><span class="p">)</span>
+
+<span class="c1">// Return a human-friendly string for the severity level.
+</span><span class="c1"></span><span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="nx">Level</span><span class="p">)</span> <span class="nf">String</span><span class="p">(</span><span class="p">)</span> <span class="kt">string</span> <span class="p">{</span>
+    <span class="k">switch</span> <span class="nx">l</span> <span class="p">{</span>
+    <span class="k">case</span> <span class="nx">LevelInfo</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s">&#34;INFO&#34;</span>
+    <span class="k">case</span> <span class="nx">LevelError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s">&#34;ERROR&#34;</span>
+    <span class="k">case</span> <span class="nx">LevelFatal</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s">&#34;FATAL&#34;</span>
+    <span class="k">default</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s">&#34;&#34;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// Define a custom Logger type. This holds the output destination that the log entries
+</span><span class="c1"></span><span class="c1">// will be written to, the minimum severity level that log entries will be written for,
+</span><span class="c1"></span><span class="c1">// plus a mutex for coordinating the writes.
+</span><span class="c1"></span><span class="kd">type</span> <span class="nx">Logger</span> <span class="kd">struct</span> <span class="p">{</span>
+    <span class="nx">out</span>      <span class="nx">io</span><span class="p">.</span><span class="nx">Writer</span>
+    <span class="nx">minLevel</span> <span class="nx">Level</span>
+    <span class="nx">mu</span>       <span class="nx">sync</span><span class="p">.</span><span class="nx">Mutex</span>
+<span class="p">}</span>
+
+<span class="c1">// Return a new Logger instance which writes log entries at or above a minimum severity
+</span><span class="c1"></span><span class="c1">// level to a specific output destination.
+</span><span class="c1"></span><span class="kd">func</span> <span class="nf">New</span><span class="p">(</span><span class="nx">out</span> <span class="nx">io</span><span class="p">.</span><span class="nx">Writer</span><span class="p">,</span> <span class="nx">minLevel</span> <span class="nx">Level</span><span class="p">)</span> <span class="o">*</span><span class="nx">Logger</span> <span class="p">{</span>
+    <span class="k">return</span> <span class="o">&amp;</span><span class="nx">Logger</span><span class="p">{</span>
+        <span class="nx">out</span><span class="p">:</span>      <span class="nx">out</span><span class="p">,</span>
+        <span class="nx">minLevel</span><span class="p">:</span> <span class="nx">minLevel</span><span class="p">,</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// Declare some helper methods for writing log entries at the different levels. Notice
+</span><span class="c1"></span><span class="c1">// that these all accept a map as the second parameter which can contain any arbitrary
+</span><span class="c1"></span><span class="c1">// &#39;properties&#39; that you want to appear in the log entry.
+</span><span class="c1"></span><span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="o">*</span><span class="nx">Logger</span><span class="p">)</span> <span class="nf">PrintInfo</span><span class="p">(</span><span class="nx">message</span> <span class="kt">string</span><span class="p">,</span> <span class="nx">properties</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nx">l</span><span class="p">.</span><span class="nb">print</span><span class="p">(</span><span class="nx">LevelInfo</span><span class="p">,</span> <span class="nx">message</span><span class="p">,</span> <span class="nx">properties</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="o">*</span><span class="nx">Logger</span><span class="p">)</span> <span class="nf">PrintError</span><span class="p">(</span><span class="nx">err</span> <span class="kt">error</span><span class="p">,</span> <span class="nx">properties</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nx">l</span><span class="p">.</span><span class="nb">print</span><span class="p">(</span><span class="nx">LevelError</span><span class="p">,</span> <span class="nx">err</span><span class="p">.</span><span class="nf">Error</span><span class="p">(</span><span class="p">)</span><span class="p">,</span> <span class="nx">properties</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="o">*</span><span class="nx">Logger</span><span class="p">)</span> <span class="nf">PrintFatal</span><span class="p">(</span><span class="nx">err</span> <span class="kt">error</span><span class="p">,</span> <span class="nx">properties</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nx">l</span><span class="p">.</span><span class="nb">print</span><span class="p">(</span><span class="nx">LevelFatal</span><span class="p">,</span> <span class="nx">err</span><span class="p">.</span><span class="nf">Error</span><span class="p">(</span><span class="p">)</span><span class="p">,</span> <span class="nx">properties</span><span class="p">)</span>
+    <span class="nx">os</span><span class="p">.</span><span class="nf">Exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="c1">// For entries at the FATAL level, we also terminate the application.
+</span><span class="c1"></span><span class="p">}</span>
+
+<span class="c1">// Print is an internal method for writing the log entry.
+</span><span class="c1"></span><span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="o">*</span><span class="nx">Logger</span><span class="p">)</span> <span class="nb">print</span><span class="p">(</span><span class="nx">level</span> <span class="nx">Level</span><span class="p">,</span> <span class="nx">message</span> <span class="kt">string</span><span class="p">,</span> <span class="nx">properties</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">)</span> <span class="p">(</span><span class="kt">int</span><span class="p">,</span> <span class="kt">error</span><span class="p">)</span> <span class="p">{</span>
+    <span class="c1">// If the severity level of the log entry is below the minimum severity for the
+</span><span class="c1"></span>    <span class="c1">// logger, then return with no further action.
+</span><span class="c1"></span>    <span class="k">if</span> <span class="nx">level</span> <span class="p">&lt;</span> <span class="nx">l</span><span class="p">.</span><span class="nx">minLevel</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="kc">nil</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Declare an anonymous struct holding the data for the log entry.
+</span><span class="c1"></span>    <span class="nx">aux</span> <span class="o">:=</span> <span class="kd">struct</span> <span class="p">{</span>
+        <span class="nx">Level</span>      <span class="kt">string</span>            <span class="s">`</span><span class="s">json:&#34;level&#34;</span><span class="s">`</span>
+        <span class="nx">Time</span>       <span class="kt">string</span>            <span class="s">`</span><span class="s">json:&#34;time&#34;</span><span class="s">`</span>
+        <span class="nx">Message</span>    <span class="kt">string</span>            <span class="s">`</span><span class="s">json:&#34;message&#34;</span><span class="s">`</span>
+        <span class="nx">Properties</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span> <span class="s">`</span><span class="s">json:&#34;properties,omitempty&#34;</span><span class="s">`</span>
+        <span class="nx">Trace</span>      <span class="kt">string</span>            <span class="s">`</span><span class="s">json:&#34;trace,omitempty&#34;</span><span class="s">`</span>
+    <span class="p">}</span><span class="p">{</span>
+        <span class="nx">Level</span><span class="p">:</span>      <span class="nx">level</span><span class="p">.</span><span class="nf">String</span><span class="p">(</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">Time</span><span class="p">:</span>       <span class="nx">time</span><span class="p">.</span><span class="nf">Now</span><span class="p">(</span><span class="p">)</span><span class="p">.</span><span class="nf">UTC</span><span class="p">(</span><span class="p">)</span><span class="p">.</span><span class="nf">Format</span><span class="p">(</span><span class="nx">time</span><span class="p">.</span><span class="nx">RFC3339</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">Message</span><span class="p">:</span>    <span class="nx">message</span><span class="p">,</span>
+        <span class="nx">Properties</span><span class="p">:</span> <span class="nx">properties</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Include a stack trace for entries at the ERROR and FATAL levels.
+</span><span class="c1"></span>    <span class="k">if</span> <span class="nx">level</span> <span class="o">&gt;=</span> <span class="nx">LevelError</span> <span class="p">{</span>
+        <span class="nx">aux</span><span class="p">.</span><span class="nx">Trace</span> <span class="p">=</span> <span class="nb">string</span><span class="p">(</span><span class="nx">debug</span><span class="p">.</span><span class="nf">Stack</span><span class="p">(</span><span class="p">)</span><span class="p">)</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Declare a line variable for holding the actual log entry text.
+</span><span class="c1"></span>    <span class="kd">var</span> <span class="nx">line</span> <span class="p">[</span><span class="p">]</span><span class="kt">byte</span>
+
+    <span class="c1">// Marshal the anonymous struct to JSON and store it in the line variable. If there
+</span><span class="c1"></span>    <span class="c1">// was a problem creating the JSON, set the contents of the log entry to be that
+</span><span class="c1"></span>    <span class="c1">// plain-text error message instead.
+</span><span class="c1"></span>    <span class="nx">line</span><span class="p">,</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nx">json</span><span class="p">.</span><span class="nf">Marshal</span><span class="p">(</span><span class="nx">aux</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+        <span class="nx">line</span> <span class="p">=</span> <span class="p">[</span><span class="p">]</span><span class="nb">byte</span><span class="p">(</span><span class="nx">LevelError</span><span class="p">.</span><span class="nf">String</span><span class="p">(</span><span class="p">)</span> <span class="o">+</span> <span class="s">&#34;: unable to marshal log message: &#34;</span> <span class="o">+</span> <span class="nx">err</span><span class="p">.</span><span class="nf">Error</span><span class="p">(</span><span class="p">)</span><span class="p">)</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Lock the mutex so that no two writes to the output destination can happen
+</span><span class="c1"></span>    <span class="c1">// concurrently. If we don&#39;t do this, it&#39;s possible that the text for two or more
+</span><span class="c1"></span>    <span class="c1">// log entries will be intermingled in the output.
+</span><span class="c1"></span>    <span class="nx">l</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nf">Lock</span><span class="p">(</span><span class="p">)</span>
+    <span class="k">defer</span> <span class="nx">l</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nf">Unlock</span><span class="p">(</span><span class="p">)</span>
+
+    <span class="c1">// Write the log entry followed by a newline.
+</span><span class="c1"></span>    <span class="k">return</span> <span class="nx">l</span><span class="p">.</span><span class="nx">out</span><span class="p">.</span><span class="nf">Write</span><span class="p">(</span><span class="nb">append</span><span class="p">(</span><span class="nx">line</span><span class="p">,</span> <span class="sc">&#39;\n&#39;</span><span class="p">)</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="c1">// We also implement a Write() method on our Logger type so that it satisfies the 
+</span><span class="c1"></span><span class="c1">// io.Writer interface. This writes a log entry at the ERROR level with no additional 
+</span><span class="c1"></span><span class="c1">// properties.
+</span><span class="c1"></span><span class="kd">func</span> <span class="p">(</span><span class="nx">l</span> <span class="o">*</span><span class="nx">Logger</span><span class="p">)</span> <span class="nf">Write</span><span class="p">(</span><span class="nx">message</span> <span class="p">[</span><span class="p">]</span><span class="kt">byte</span><span class="p">)</span> <span class="p">(</span><span class="nx">n</span> <span class="kt">int</span><span class="p">,</span> <span class="nx">err</span> <span class="kt">error</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">return</span> <span class="nx">l</span><span class="p">.</span><span class="nb">print</span><span class="p">(</span><span class="nx">LevelError</span><span class="p">,</span> <span class="nb">string</span><span class="p">(</span><span class="nx">message</span><span class="p">)</span><span class="p">,</span> <span class="kc">nil</span><span class="p">)</span>
+<span class="p">}</span></pre>
+</figure>
+
+<aside class="note"><p>
+<strong>Note:</strong> If you want, you could extend this code to support additional <a href="https://stackoverflow.com/a/2031209">severity levels</a> such as <code>DEBUG</code> and <code>WARNING</code>.
+</p></aside>
+
+<p>Essentially, our <code>Logger</code> type is a fairly thin wrapper around an <code>io.Writer</code>.  We have some helper methods like <code>PrintInfo()</code> and <code>PrintError()</code> which accept some data for the log entry, encode this data to JSON, and then write it to the <code>io.Writer</code>.</p>
+
+<p>The two most interesting things to point out in this code are our use of the <a href="https://golang.org/pkg/builtin/#pkg-constants"><code>iota</code></a> enumerator to create the log levels and a <a href="https://golang.org/pkg/sync/#Mutex"><code>sync.Mutex</code></a> to coordinate the writes.</p>
+
+<p>You can use <code>iota</code> to easily assign successive integer values to a set of integer <em>constants</em>. It starts at zero, and increments by 1 for every constant declaration, resetting to 0 when the word <code>const</code> appears in the code again. The way that we&rsquo;ve used this means that each of our severity levels has an integer value, with the <em>more severe levels having a higher value</em>.</p>
+
+<p>We&rsquo;re also using a <a href="https://golang.org/pkg/sync/#Mutex"><code>sync.Mutex</code></a> (a <em>mutual exclusion lock</em>) to prevent our <code>Logger</code> instance making multiple writes concurrently. Without this mutex lock, it&rsquo;s possible that the content of multiple log entries would be written at exactly the same time and be mixed up in the output, rather than each entry being written in full on its own line.</p>
+
+<aside class="important"><p>
+<strong>Important:</strong> How mutexes work, and how to use them, can be quite confusing if you haven&rsquo;t encountered them before and it&rsquo;s impossible to fully explain in a few short sentences. I&rsquo;ve written a much more detailed article &mdash; <a href="https://www.alexedwards.net/blog/understanding-mutexes">Understanding Mutexes</a> &mdash; which provides a proper explanation, and if you&rsquo;re not already confident with mutexes I highly recommend reading this before you continue.
+</p></aside>
+
+<p>Now that&rsquo;s in place, let&rsquo;s update our <code>cmd/api/main.go</code> file to create a new <code>Logger</code> instance and then use it in our code. We&rsquo;ll also add it to our <code>application</code> struct, so that it&rsquo;s available as a dependency to all our handlers and helpers.</p>
+
+<p>Like so:</p>
+
+<figure class="code go">
+<figcaption>File: cmd/api/main.go</figcaption>
+<pre><span class="kn">package</span> <span class="nx">main</span>
+
+<span class="kn">import</span> <span class="p">(</span>
+    <span class="s">&#34;context&#34;</span>
+    <span class="s">&#34;database/sql&#34;</span>
+    <span class="s">&#34;flag&#34;</span>
+    <span class="s">&#34;fmt&#34;</span>
+    <span class="s">&#34;net/http&#34;</span>
+    <span class="s">&#34;os&#34;</span>
+    <span class="s">&#34;time&#34;</span>
+
+    <span class="s">&#34;greenlight.alexedwards.net/internal/data&#34;</span>
+    <span class="s">&#34;greenlight.alexedwards.net/internal/jsonlog&#34;</span> <span class="c1">// New import
+</span><span class="c1"></span>
+    <span class="nx">_</span> <span class="s">&#34;github.com/lib/pq&#34;</span>
+<span class="p">)</span>
+
+<span class="o">...</span>
+
+<span class="c1">// Change the logger field to have the type *jsonlog.Logger, instead of
+</span><span class="c1"></span><span class="c1">// *log.Logger.
+</span><span class="c1"></span><span class="kd">type</span> <span class="nx">application</span> <span class="kd">struct</span> <span class="p">{</span>
+    <span class="nx">config</span> <span class="nx">config</span>
+    <span class="nx">logger</span> <span class="o">*</span><span class="nx">jsonlog</span><span class="p">.</span><span class="nx">Logger</span>
+    <span class="nx">models</span> <span class="nx">data</span><span class="p">.</span><span class="nx">Models</span>
+<span class="p">}</span>
+
+<span class="kd">func</span> <span class="nf">main</span><span class="p">(</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kd">var</span> <span class="nx">cfg</span> <span class="nx">config</span>
+
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">IntVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">port</span><span class="p">,</span> <span class="s">&#34;port&#34;</span><span class="p">,</span> <span class="mi">4000</span><span class="p">,</span> <span class="s">&#34;API server port&#34;</span><span class="p">)</span>
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">StringVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">env</span><span class="p">,</span> <span class="s">&#34;env&#34;</span><span class="p">,</span> <span class="s">&#34;development&#34;</span><span class="p">,</span> <span class="s">&#34;Environment (development|staging|production)&#34;</span><span class="p">)</span>
+
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">StringVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">db</span><span class="p">.</span><span class="nx">dsn</span><span class="p">,</span> <span class="s">&#34;db-dsn&#34;</span><span class="p">,</span> <span class="nx">os</span><span class="p">.</span><span class="nf">Getenv</span><span class="p">(</span><span class="s">&#34;GREENLIGHT_DB_DSN&#34;</span><span class="p">)</span><span class="p">,</span> <span class="s">&#34;PostgreSQL DSN&#34;</span><span class="p">)</span>
+
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">IntVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">db</span><span class="p">.</span><span class="nx">maxOpenConns</span><span class="p">,</span> <span class="s">&#34;db-max-open-conns&#34;</span><span class="p">,</span> <span class="mi">25</span><span class="p">,</span> <span class="s">&#34;PostgreSQL max open connections&#34;</span><span class="p">)</span>
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">IntVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">db</span><span class="p">.</span><span class="nx">maxIdleConns</span><span class="p">,</span> <span class="s">&#34;db-max-idle-conns&#34;</span><span class="p">,</span> <span class="mi">25</span><span class="p">,</span> <span class="s">&#34;PostgreSQL max idle connections&#34;</span><span class="p">)</span>
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">StringVar</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">cfg</span><span class="p">.</span><span class="nx">db</span><span class="p">.</span><span class="nx">maxIdleTime</span><span class="p">,</span> <span class="s">&#34;db-max-idle-time&#34;</span><span class="p">,</span> <span class="s">&#34;15m&#34;</span><span class="p">,</span> <span class="s">&#34;PostgreSQL max connection idle time&#34;</span><span class="p">)</span>
+
+    <span class="nx">flag</span><span class="p">.</span><span class="nf">Parse</span><span class="p">(</span><span class="p">)</span>
+
+    <span class="c1">// Initialize a new jsonlog.Logger which writes any messages *at or above* the INFO
+</span><span class="c1"></span>    <span class="c1">// severity level to the standard out stream.
+</span><span class="c1"></span>    <span class="nx">logger</span> <span class="o">:=</span> <span class="nx">jsonlog</span><span class="p">.</span><span class="nf">New</span><span class="p">(</span><span class="nx">os</span><span class="p">.</span><span class="nx">Stdout</span><span class="p">,</span> <span class="nx">jsonlog</span><span class="p">.</span><span class="nx">LevelInfo</span><span class="p">)</span>
+
+    <span class="nx">db</span><span class="p">,</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nf">openDB</span><span class="p">(</span><span class="nx">cfg</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+        <span class="c1">// Use the PrintFatal() method to write a log entry containing the error at the
+</span><span class="c1"></span>        <span class="c1">// FATAL level and exit. We have no additional properties to include in the log
+</span><span class="c1"></span>        <span class="c1">// entry, so we pass nil as the second parameter.
+</span><span class="c1"></span>        <span class="nx">logger</span><span class="p">.</span><span class="nf">PrintFatal</span><span class="p">(</span><span class="nx">err</span><span class="p">,</span> <span class="kc">nil</span><span class="p">)</span>
+    <span class="p">}</span>
+
+    <span class="k">defer</span> <span class="nx">db</span><span class="p">.</span><span class="nf">Close</span><span class="p">(</span><span class="p">)</span>
+    <span class="c1">// Likewise use the PrintInfo() method to write a message at the INFO level.
+</span><span class="c1"></span>    <span class="nx">logger</span><span class="p">.</span><span class="nf">PrintInfo</span><span class="p">(</span><span class="s">&#34;database connection pool established&#34;</span><span class="p">,</span> <span class="kc">nil</span><span class="p">)</span>
+
+    <span class="nx">app</span> <span class="o">:=</span> <span class="o">&amp;</span><span class="nx">application</span><span class="p">{</span>
+        <span class="nx">config</span><span class="p">:</span> <span class="nx">cfg</span><span class="p">,</span>
+        <span class="nx">logger</span><span class="p">:</span> <span class="nx">logger</span><span class="p">,</span>
+        <span class="nx">models</span><span class="p">:</span> <span class="nx">data</span><span class="p">.</span><span class="nf">NewModels</span><span class="p">(</span><span class="nx">db</span><span class="p">)</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="nx">srv</span> <span class="o">:=</span> <span class="o">&amp;</span><span class="nx">http</span><span class="p">.</span><span class="nx">Server</span><span class="p">{</span>
+        <span class="nx">Addr</span><span class="p">:</span>         <span class="nx">fmt</span><span class="p">.</span><span class="nf">Sprintf</span><span class="p">(</span><span class="s">&#34;:%d&#34;</span><span class="p">,</span> <span class="nx">cfg</span><span class="p">.</span><span class="nx">port</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">Handler</span><span class="p">:</span>      <span class="nx">app</span><span class="p">.</span><span class="nf">routes</span><span class="p">(</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">IdleTimeout</span><span class="p">:</span>  <span class="nx">time</span><span class="p">.</span><span class="nx">Minute</span><span class="p">,</span>
+        <span class="nx">ReadTimeout</span><span class="p">:</span>  <span class="mi">10</span> <span class="o">*</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">,</span>
+        <span class="nx">WriteTimeout</span><span class="p">:</span> <span class="mi">30</span> <span class="o">*</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Again, we use the PrintInfo() method to write a &#34;starting server&#34; message at the
+</span><span class="c1"></span>    <span class="c1">// INFO level. But this time we pass a map containing additional properties (the
+</span><span class="c1"></span>    <span class="c1">// operating environment and server address) as the final parameter.
+</span><span class="c1"></span>    <span class="nx">logger</span><span class="p">.</span><span class="nf">PrintInfo</span><span class="p">(</span><span class="s">&#34;starting server&#34;</span><span class="p">,</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">{</span>
+        <span class="s">&#34;addr&#34;</span><span class="p">:</span> <span class="nx">srv</span><span class="p">.</span><span class="nx">Addr</span><span class="p">,</span>
+        <span class="s">&#34;env&#34;</span><span class="p">:</span>  <span class="nx">cfg</span><span class="p">.</span><span class="nx">env</span><span class="p">,</span>
+    <span class="p">}</span><span class="p">)</span>
+
+    <span class="nx">err</span> <span class="p">=</span> <span class="nx">srv</span><span class="p">.</span><span class="nf">ListenAndServe</span><span class="p">(</span><span class="p">)</span>
+    <span class="c1">// Use the PrintFatal() method to log the error and exit.
+</span><span class="c1"></span>    <span class="nx">logger</span><span class="p">.</span><span class="nf">PrintFatal</span><span class="p">(</span><span class="nx">err</span><span class="p">,</span> <span class="kc">nil</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="o">...</span></pre>
+</figure>
+
+<p>We&rsquo;ll also need to update the <code>logError()</code> helper in our <code>cmd/api/errors.go</code> file to use our new <code>Logger</code> instance. One of the nice things here is that it&rsquo;s simple to include additional information as properties when logging the error.</p>
+
+<p>If you&rsquo;re following along, go ahead and update the <code>logError()</code> method so that it records the request URL and method alongside the error message. Like so:</p>
+
+<figure class="code go">
+<figcaption>File: cmd/api/errors.go</figcaption>
+<pre><span class="kn">package</span> <span class="nx">main</span>
+
+<span class="o">...</span>
+
+<span class="kd">func</span> <span class="p">(</span><span class="nx">app</span> <span class="o">*</span><span class="nx">application</span><span class="p">)</span> <span class="nf">logError</span><span class="p">(</span><span class="nx">r</span> <span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">,</span> <span class="nx">err</span> <span class="kt">error</span><span class="p">)</span> <span class="p">{</span>
+    <span class="c1">// Use the PrintError() method to log the error message, and include the current 
+</span><span class="c1"></span>    <span class="c1">// request method and URL as properties in the log entry.
+</span><span class="c1"></span>    <span class="nx">app</span><span class="p">.</span><span class="nx">logger</span><span class="p">.</span><span class="nf">PrintError</span><span class="p">(</span><span class="nx">err</span><span class="p">,</span> <span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">{</span>
+        <span class="s">&#34;request_method&#34;</span><span class="p">:</span> <span class="nx">r</span><span class="p">.</span><span class="nx">Method</span><span class="p">,</span>
+        <span class="s">&#34;request_url&#34;</span><span class="p">:</span>    <span class="nx">r</span><span class="p">.</span><span class="nx">URL</span><span class="p">.</span><span class="nf">String</span><span class="p">(</span><span class="p">)</span><span class="p">,</span>
+    <span class="p">}</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="o">...</span></pre>
+</figure>
+
+<p>At this point, if you restart the application you should now see two <code>INFO</code> level log entries in JSON format like so:</p>
+
+<figure class="code bash">
+<pre>$ go run ./cmd/api
+<samp>{&#34;level&#34;:&#34;INFO&#34;,&#34;time&#34;:&#34;2021-04-10T08:08:36Z&#34;,&#34;message&#34;:&#34;database connection pool established&#34;}
+{&#34;level&#34;:&#34;INFO&#34;,&#34;time&#34;:&#34;2021-04-10T08:08:36Z&#34;,&#34;message&#34;:&#34;starting server&#34;,&#34;properties&#34;:{&#34;addr&#34;:&#34;:4000&#34;,&#34;env&#34;:&#34;development&#34;}}</samp></pre>
+</figure>
+
+<p>Notice how in the second log entry the additional properties have been included in a nested JSON object?</p>
+
+<p>If you like, you can also try opening a second terminal window and starting another instance of the API listening on the same port. This should result in a <code>FATAL</code> log entry and stack trace being printed, followed by the application immediately exiting. Similar to this:</p>
+
+<figure class="code bash">
+<pre>$ go run ./cmd/api
+<samp>{&#34;level&#34;:&#34;INFO&#34;,&#34;time&#34;:&#34;2021-04-10T08:09:53Z&#34;,&#34;message&#34;:&#34;database connection pool established&#34;}
+{&#34;level&#34;:&#34;INFO&#34;,&#34;time&#34;:&#34;2021-04-10T08:09:53Z&#34;,&#34;message&#34;:&#34;starting server&#34;,&#34;properties&#34;:{&#34;addr&#34;:&#34;:4000&#34;,&#34;env&#34;:&#34;development&#34;}}
+{&#34;level&#34;:&#34;FATAL&#34;,&#34;time&#34;:&#34;2021-04-10T08:09:53Z&#34;,&#34;message&#34;:&#34;listen tcp :4000: bind: address already in use&#34;,&#34;trace&#34;:&#34;...&#34;}
+exit status 1</samp></pre>
+</figure>
+
+<hr />
+
+<h3 id="additional-information">Additional Information</h3>
+
+<h4 id="integration-with-the-http-server-error-log">Integration with the http.Server error log</h4>
+
+<p>It&rsquo;s important to be aware that Go&rsquo;s <code>http.Server</code> may also write its own log messages relating to things like unrecovered panics, or problems accepting and writing to HTTP connections.</p>
+
+<p>By default, it writes these messages to the <a href="https://golang.org/pkg/log/#pkg-overview">standard logger</a> &mdash; which means they will be written to the standard error stream (instead of standard out like our other log messages), and they won&rsquo;t be in our nice new JSON format.</p>
+
+<p>If you want everything logged in one place, in the same format, then that&rsquo;s obviously a problem.</p>
+
+<p>Unfortunately, you can&rsquo;t set <code>http.Server</code> to use our new <code>Logger</code> type directly. Instead, you will need to leverage the fact that our <code>Logger</code> satisfies the <code>io.Writer</code> interface (thanks to the <code>Write()</code> method that we added to it), and set <code>http.Server</code> to use a regular <a href="https://golang.org/pkg/log/#Logger"><code>log.Logger</code></a> instance from the standard library which <em>writes to</em> our own <code>Logger</code> as the target destination.</p>
+
+<p>It&rsquo;s simpler than it sounds. All you have to do is something like this:</p>
+
+<figure class="code go">
+<pre><span class="kd">func</span> <span class="nf">main</span><span class="p">(</span><span class="p">)</span> <span class="p">{</span>
+
+    <span class="o">...</span>
+
+    <span class="c1">// Initialize the custom logger.
+</span><span class="c1"></span>    <span class="nx">logger</span> <span class="o">:=</span> <span class="nx">jsonlog</span><span class="p">.</span><span class="nf">New</span><span class="p">(</span><span class="nx">os</span><span class="p">.</span><span class="nx">Stdout</span><span class="p">,</span> <span class="nx">jsonlog</span><span class="p">.</span><span class="nx">LevelInfo</span><span class="p">)</span>
+
+    <span class="o">...</span>
+
+    <span class="nx">srv</span> <span class="o">:=</span> <span class="o">&amp;</span><span class="nx">http</span><span class="p">.</span><span class="nx">Server</span><span class="p">{</span>
+        <span class="nx">Addr</span><span class="p">:</span>         <span class="nx">fmt</span><span class="p">.</span><span class="nf">Sprintf</span><span class="p">(</span><span class="s">&#34;:%d&#34;</span><span class="p">,</span> <span class="nx">cfg</span><span class="p">.</span><span class="nx">port</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">Handler</span><span class="p">:</span>      <span class="nx">app</span><span class="p">.</span><span class="nf">routes</span><span class="p">(</span><span class="p">)</span><span class="p">,</span>
+        <span class="c1">// Create a new Go log.Logger instance with the log.New() function, passing in 
+</span><span class="c1"></span>        <span class="c1">// our custom Logger as the first parameter. The &#34;&#34; and 0 indicate that the
+</span><span class="c1"></span>        <span class="c1">// log.Logger instance should not use a prefix or any flags.
+</span><span class="c1"></span>        <span class="nx">ErrorLog</span><span class="p">:</span>     <span class="nx">log</span><span class="p">.</span><span class="nf">New</span><span class="p">(</span><span class="nx">logger</span><span class="p">,</span> <span class="s">&#34;&#34;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span><span class="p">,</span>
+        <span class="nx">IdleTimeout</span><span class="p">:</span>  <span class="nx">time</span><span class="p">.</span><span class="nx">Minute</span><span class="p">,</span>
+        <span class="nx">ReadTimeout</span><span class="p">:</span>  <span class="mi">10</span> <span class="o">*</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">,</span>
+        <span class="nx">WriteTimeout</span><span class="p">:</span> <span class="mi">30</span> <span class="o">*</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="o">...</span>
+<span class="p">}</span></pre>
+</figure>
+
+<p>With that set up, any log messages that <code>http.Server</code> writes will be passed to our <code>Logger.Write()</code> method, which in turn will output a log entry in JSON format at the <code>ERROR</code> level.</p>
+
+<h4 id="third-party-logging-packages">Third-party logging packages</h4>
+
+<p>If you don&rsquo;t want to implement your own custom logger, like we have in this chapter, then there is a plethora of <a href="https://github.com/avelino/awesome-go#logging">third-party packages</a> available which implement structured logging in JSON (and other) formats.</p>
+
+<p>If I had to recommend one, it would be <a href="https://github.com/rs/zerolog">zerolog</a>. It has a nice interface, and a good range of customization options. It&rsquo;s also designed to be very  fast and cheap in terms of memory allocations when writing log entries, so if your application is doing a lot of logging (i.e. more than just occasional information and error messages) then it may be a sensible choice.</p>
+
+			
+		</main>
+		<footer>
+			<div class="wrapper">
+				<div>
+					&lsaquo; <a href="10.00-structured-logging-and-error-handling.html">Previous</a>
+				</div>
+				<div>
+					<a href="00.01-contents.html">Contents</a>
+				</div>
+				<div>
+					<a href="10.02-panic-recovery.html">Next</a> &rsaquo;
+				</div>
+			</div>
+		</footer>
+	</body>
+</html>
